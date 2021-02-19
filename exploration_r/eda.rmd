@@ -1,0 +1,599 @@
+---
+title: "Rob's EDA"
+author: "Rob Mansfield"
+date: 22/01/2021
+output: 
+  rmdformats::readthedown:
+    highlight: kate
+  
+---
+
+```{r include=FALSE}
+library(knitr)
+
+options(max.print="75")
+knitr::opts_chunk$set(echo = FALSE, include=TRUE, cache=FALSE, warning=FALSE, comment=NA, dev.args = list(bg = 'transparent'))
+opts_knit$set(width=75)
+
+# Initial build may take a while, tidyverse is big.
+library(checkpoint)
+checkpoint("2020-12-21", getwd(),"4.0.2")
+
+library(tidyverse)
+library(skimr)
+library(reshape2)
+library(rmdformats)
+library(corrplot)
+
+
+```
+
+
+# Read in
+
+```{r message=FALSE, warning=TRUE, include=FALSE}
+newData <- 
+  read_delim("..\\data\\SIATestDataSalefile.psv.gz", "|") %>% 
+  arrange(Accountid, Month)
+```
+
+```{r}
+newData
+```
+
+
+```{r include=FALSE}
+oldData <- read_delim("..\\data\\SIATestDataBuildSample.psv.gz", "|") %>% 
+  arrange(Accountid, Month)
+
+```
+
+```{r}
+oldData
+```
+
+
+# Quick data summary
+You'll need a wide screen to see the histograms. If this is markdown there's a scroller at the bottom.
+
+* Only 3 unique values on balance band, not the most informative! Suggest a rescale
+* Only 5 on remaining balance band
+* NAs in SD and var columns, clearly needed but will have to deal with!
+* NAs in monthstodefault and age which need checking. Interestingly they are NA the same number of times!
+* Most of the numeric columns have really long tails. I assume there are some whales in there that are skewing everything (or people who haven't paid for ages!). Would present problems to anything linear. 
+* Intersting that there's a "collectionstodate" of 5560. Interested as to who that is, could it be our 88 person?               
+* Someone has paid 200% of their balance
+* There's a monthstodefault of 592
+* I find it interesting that there's only 2,379 unique default dates. I suppose only 365 days a year and there's thousands of accounts...
+
+```{r}
+skim(oldData)
+```
+
+# Correlations
+Not a lot surprising here. Most correlations would appear to be things you would expect (balance and initial balance for example). There's clearly been some feature engineering here that's created columns based on others. 
+
+There may be more to pick apart here but my quick skim doesn't make me concerned about much.
+
+```{r fig.width=6}
+sig <- 0.5
+
+#convert data to numeric in order to run correlations
+#convert to factor first to keep the integrity of the data - each value will become a number rather than turn into NA
+df_cor <- oldData %>% mutate_if(is.character, as.factor)
+df_cor <- df_cor %>% mutate_if(is.factor, as.numeric)
+
+# Gonna just year-ify the dates. They don't count for much really. Hoping default date has something. 
+is.POSIXct <- function(x) inherits(x, "POSIXct")
+df_cor<- df_cor %>% mutate_if(is.POSIXct, lubridate::year)
+
+corr <- cor(df_cor)
+corr[lower.tri(corr,diag=TRUE)] <- NA #drop duplicates
+corr <- as.data.frame(as.table(corr))#turn into a 3-column table
+corr <- na.omit(corr) 
+corr <- subset(corr, abs(Freq) > sig)
+corr <- corr[order(-abs(corr$Freq)),] 
+# print(corr)
+#turn corr back into matrix for plotting
+mtx_corr <- reshape2::acast(corr, Var1~Var2, value.var="Freq")
+corrplot(mtx_corr, is.corr=FALSE, tl.col="black", na.label=" ")
+```
+# First Month's Data
+
+I'm assuming that, as there's 10,000 of these and most of the IDs appear in the newData then they represent the accounts that we started with. This is reinforced by the fact that the min value for month is shortly before AA were incorporated, suggesting they are the initial batch of accounts. I am therefore also assuming that there have been no previous interactions between AA and these accounts before this date. TBC whether the data hold up to this. 
+
+```{r}
+initialData <- oldData %>% filter(Month == min(Month))
+initialData
+```
+
+# Settled Accounts
+
+```{r}
+settledAccounts <- oldData %>% filter(settle == 1)
+settledAccounts
+```
+
+Just making sure settled == last transaction...
+
+```{r}
+length(unique(settledAccounts$Accountid))
+nrow(settledAccounts)
+```
+
+So, what exactly does the settlement mean? For the most part (and this info is repeated later as this is out of order at present) it seems that a lower amount is accepted BUT in a couple of cases this is not true, the account is actually paid in full. c.f. 13939905. I'll explore this more later, probably when I make the isRepaid flag. 
+
+```{r}
+oldData %>% 
+  filter(Accountid %in% settledAccounts$Accountid) %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+# 13939905
+```
+
+
+## Create "is repaid"
+As this is not currently flagged I want to make one and see what it says. 
+
+```{r}
+oldData$repaid <- oldData$remainingbalance <= 0
+
+oldData %>% 
+  filter(repaid) %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+
+```
+
+
+## Is repaid & settled? 
+So, for 29 Accounts they paid the full balance and were listed as settled as well. There are now three cases of account completion: Repayment, settlement and both. Given that these seem to be quite large payments, I wonder if it's just them ringing up and paying what's outstanding?
+
+```{r}
+pltDat <- 
+  oldData %>% 
+  filter(repaid & settle)  %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+
+length(unique(pltDat$Accountid))
+pltDat
+```
+
+Checking out the whole account history of the above now. 
+
+52825973 is worth note. They were paying down slowly then they paid a lot more for a couple of months then settled out. 
+
+```{r}
+pltDat <- 
+  oldData %>% 
+  filter(repaid & settle)  %>% 
+  select(Accountid) %>% 
+  inner_join(oldData) %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction) 
+
+length(unique(pltDat$Accountid))
+pltDat
+```
+
+## Settlement date
+This is the date the account settled so it's knowledge of the future. It should == the date that settled is 1. 
+
+```{r}
+oldData %>% 
+  filter(settle == 1) %>% 
+  filter(settlementdate != Month) %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction) 
+```
+...but I bet that it doesn't represent repaid...
+
+check: 26728501
+```{r}
+oldData %>% 
+  filter(repaid) %>% 
+  filter(settlementdate != Month) %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction) %>% 
+  arrange(settlementdate, Accountid)
+```
+
+### Repaid with a settled date
+There are some repaid flags that have settlements in the past. Not many though, most are in the future (2019-02-08). Let's check one of the former.
+
+
+This one has a settlement date != when the loan was repaid. 
+```{r}
+oldData %>% 
+  filter(Accountid == 26354084) %>% 
+  select(Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+```
+
+This one did repay and the date makes sense
+```{r}
+oldData %>% 
+  filter(Accountid == 26728501) %>% 
+  select(Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+```
+
+This one it's the month before. Basically it's a bit of a mess. 
+```{r}
+oldData %>% 
+  filter(Accountid == 53067278) %>% 
+  select(Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle, MonthlyTransaction)
+```
+
+# Lost Accounts in newData
+
+I am curious about those 304 accounts that have been lost. Some are settled but that's not enough for everyone...
+
+```{r}
+length(unique(newData$Accountid))
+length(unique(oldData$Accountid))
+length(unique(initialData$Accountid))
+```
+
+```{r}
+pltDat <- 
+  oldData %>% 
+  filter(!Accountid %in% settledAccounts$Accountid) %>% 
+  filter(!Accountid %in% newData$Accountid) 
+
+pltDat
+```
+
+I find this interesting. I would assume that people that are not in the newData have either settled or folded. My expectation would be that 
+someone who is paying regularly wouldn't be looking to fold but that may just be me.
+
+Ah! I see, so the current balance is before payment. Remaining balance is after? Check this in the keys etc. Looks like the remaining balance for this one is -ve, indicating that their last payment cleared it. *So why is it not settled and why is the settlement date 2019?*
+
+```{r}
+newData %>% filter(Accountid == 13702568)
+oldData %>% filter(Accountid == 13702568)
+```
+
+This one is only paying 1 every month, a minuscule amount of the balance. Have they disappeared as they've been written off/folded? They certainly aren't moving anywhere towards their settlement date!
+
+```{r}
+newData %>% filter(Accountid == 13721097)
+oldData %>% filter(Accountid == 13721097)
+```
+
+These also paid off everything, their settlement date is the same as the other person who paid off everything. 
+
+```{r}
+newData %>% filter(Accountid == 13841713)
+oldData %>% filter(Accountid == 13841713)
+```
+
+Just to double check, none of the above account's stuff ever says settled, yes? Their final payment is also before the last month in the dataset.
+
+```{r}
+max(oldData$Month)
+
+oldData %>% 
+  filter(Accountid == 13841713) %>% 
+  select(Month, Number,CurrentBalance, DefaultAmt, settlementdate, remainingbalance, settle)
+```
+
+Wait, this person has paid their whole amount and is listed as settled? What does their whole timeline look like? So it looks like they missed a payment then settled, but in this instance the debt was settled in full sooooo....settled can include that? Is it just that "setted" means formally settled and not just paid off in instalments? I'd have to do some feature engineering to pick apart those two cases of settlement, if they even exist as separate entities. 
+
+```{r}
+newData %>% filter(Accountid == 13939905)
+oldData %>% filter(Accountid == 13939905)
+```
+
+
+# Accounts not active or paid
+
+So all accounts fall into one of these three categories which is good *but* some fit in more than one. A few hundred of the accounts in the newData are already repaid, they just aren't listed as settled. 
+
+```{r}
+repaidAcc  <- oldData %>% filter(repaid) %>% select(Accountid) %>% distinct()   #425
+settledAcc  <- oldData %>% filter(settle == 1)  %>% distinct() #77
+openAcc  <- newData %>% select(Accountid) %>% select(Accountid) %>% distinct()  #9,696
+
+accFilter <- bind_rows(repaidAcc, settledAcc, openAcc) %>% distinct() 
+
+```
+
+```{r}
+repaidAcc %>% filter(Accountid %in% settledAcc$Accountid)
+repaidAcc %>% filter(Accountid %in% openAcc$Accountid)
+```
+
+```{r}
+settledAcc %>% filter(Accountid %in% openAcc$Accountid)
+```
+
+```{r}
+newData %>% filter(Accountid %in% repaidAcc$Accountid)
+```
+
+# inSample column
+I'm assuming that this is to do with some stats on their end but want to just check its distribution. 
+
+Looks like it's by Id, not transaction. Well done.
+
+```{r}
+oldData %>% 
+  filter(insample == 1) %>% 
+  distinct() %>% 
+  nrow() / nrow(oldData)
+
+oldData %>% 
+  filter(insample == 1) %>% 
+  select(Accountid) %>% 
+  distinct() %>% 
+  nrow()
+  
+
+```
+
+# Dates
+Looks like the latest default is the start of the dataset...
+```{r}
+ggplot(oldData, aes(x=DefaultDate)) +
+  geom_histogram(fill="steelblue", alpha=0.8) +
+  theme_minimal()
+```
+
+```{r}
+max(oldData$DefaultDate)
+min(oldData$DefaultDate)
+```
+
+Look at this one! defaulted in 1988 (apparently) and is paying off ~1 a month.
+```{r}
+oldData %>% 
+  filter(DefaultDate == min(oldData$DefaultDate))
+```
+
+# prevCols and PreviousPayments
+
+Duplicated mthinks. 
+
+```{r}
+oldData %>% 
+  select(Accountid, Month, Number,CurrentBalance, DefaultAmt, settlementdate, 
+         remainingbalance, settle, MonthlyTransaction, PrevCols, PreviousPayments)
+```
+
+# Bands
+I do not like the fact that someone has already made bands. What were they made for? These data? All data? 
+
+Also, it's irksome that when the bands are one hotted we 1) have all of them and 2) don't have informative names. I should do some renaming but then I also have to handle the bloody unicode.
+
+* CollectionsBand: numeric encoded
+* remainingbalband: numeric encoded
+* balanceband: numeric encoded BUT THEY DO NOT ALIGN!!!!! Looks like the error is in the banding, need to remake
+* lastpatband: One-hotted, some columns contain NAs. Suggest we just numeric encode and drop for now. Can play later. 
+
+```{r}
+oldData
+```
+
+
+## balanceband error
+```{r}
+oldData %>% 
+  select(remainingbalband, balanceband, remainingbalbandN, balancebandN) %>% 
+  filter(balancebandN == 7)
+
+```
+
+```{r}
+oldData %>% 
+  select(remainingbalband, balanceband, remainingbalbandN, balancebandN) %>% 
+  filter(balancebandN == 8)
+```
+
+## Check all the bands for errors? 
+
+```{r}
+oldData %>% 
+  select(CollectionsBand, CollectionsBandN) %>% 
+  mutate(bandN = as.numeric(str_sub(CollectionsBand, 0, 2))) %>% 
+  filter(bandN != CollectionsBandN)
+  # filter(is.na(bandN))
+```
+```{r}
+oldData %>% 
+  select(remainingbalband, remainingbalbandN) %>% 
+  mutate(bandN = as.numeric(str_sub(remainingbalband, 0, 2))) %>% 
+  filter(bandN != remainingbalbandN)
+  # filter(is.na(bandN))
+```
+
+Looks like it's wrong more often than it's right!!!!
+```{r}
+oldData %>% 
+  # select(CurrentBalance, balanceband, balancebandN) %>% 
+  mutate(bandN = as.numeric(str_sub(balanceband, 0, 2))) %>% 
+  filter(bandN != balancebandN)
+  # filter(is.na(bandN))
+```
+
+
+# transflag
+How many accounts haven't made a past payment? Is this just us or prior to the dataset starting? 
+
+So transflag can be 1 at start of dataset, before AA or just previous history then. 
+
+```{r}
+oldData %>% 
+  select(Accountid, Month, transflag)
+```
+
+How many accounts had transflag initially? About 59%
+```{r}
+initialData %>% filter(transflag == 1) %>% nrow()
+
+nrow(initialData)
+```
+
+How many had it changed to 1 over the dataset?
+None?! Seriously!?
+```{r}
+oldData  %>% 
+  filter(transflag == 1) %>%  
+  select(Accountid) %>% 
+  distinct() %>% 
+  nrow()
+
+```
+What about in the new data? 304 fewer. Interestingly that's exactly the number missing between the two datasets.
+```{r}
+newData  %>% 
+  filter(transflag == 1) %>%  
+  select(Accountid) %>% 
+  distinct() %>% 
+  nrow()
+```
+
+Is transflag actually updated properly? Apparently so. 
+```{r}
+oldData  %>% 
+  filter(transflag == 0) %>%  
+  filter(MonthlyTransaction > 0)
+```
+
+Based on this bombshell I'm gonna drop these people for now. I think this is feature leak but I don't know and it solves some of the 0 inflation stuff. 
+
+Looks like 57 of our transflag==1 peeps (of which there are 5,889) don't pay in the dataset at all. So...why is it one? I'm so confused. Possibly paid in the new data? 
+
+```{r}
+pltDat <- 
+  oldData %>% 
+  filter(MonthlyTransaction > 0) %>% 
+  select(Accountid) %>% 
+  distinct()
+
+initialData %>% 
+  filter(transflag == 1) %>% 
+  filter(!Accountid %in% pltDat$Accountid) %>% 
+  select(Accountid) %>% 
+  distinct() %>% 
+  nrow()
+
+```
+
+# Months
+Not everyone has data for all months
+
+```{r}
+pltDat <- 
+  oldData %>% 
+  select(Accountid, Number) %>% 
+  group_by(Accountid) %>% 
+  summarise(latestMonth = max(Number))
+
+ggplot(pltDat, aes(x=latestMonth)) +
+  geom_bar(fill = 'steelblue', alpha=0.8) +
+  scale_y_log10() +
+  theme_minimal()
+```
+
+
+# Odd NA cols
+```{r}
+oldData %>% 
+  filter(is.na(monthstodefault))
+
+```
+
+
+# Amounts people pay
+This bit of EDA is gonna be really expansive and I'm short on time. Perhaps a re-visit later...
+
+Probs interesting to check if remaining balance ever goes up instead of down. I do know it can go -ve. 
+
+```{r}
+oldData
+```
+
+
+# Model Predictor
+
+Let's just do percentage repaid for now.
+```{r}
+modDat <- 
+  oldData %>% 
+  filter(Number < 12) %>% 
+  select(Accountid, Number) %>% 
+  group_by(Accountid) %>% 
+  summarise(Number = max(Number)) %>% 
+  ungroup() %>% 
+  inner_join(oldData, by=c("Accountid", "Number")) %>% 
+  select(Accountid, remainingbalance) %>% 
+  inner_join(oldData %>% filter(Number == 0) %>% select(Accountid, CurrentBalance, transflag)) %>% 
+  transmute(Accountid, 
+            CurrentBalance, 
+            transflag,
+            BalanceAtEoY=remainingbalance,
+            propRepaid=1-(BalanceAtEoY/CurrentBalance)) %>% 
+  mutate(propRepaid = ifelse(propRepaid >1, 1, propRepaid))   # Some repay up to 1.5x!!!!
+modDat
+```
+
+Lots of 0s here, it's likely I will need 2 models: 1 for if 0 and then one for value if not 0. 
+
+```{r}
+ggplot(modDat, aes(x=round(propRepaid, 1))) +
+  geom_bar(fill='steelblue', alpha=0.8) +
+  theme_minimal()
+```
+
+Without the transflag 0s it's better but not awesome. Is the transflag feature leak or information?!?!?!?
+```{r}
+ggplot(modDat %>% filter(transflag == 1), aes(x=round(propRepaid, 1))) +
+  geom_bar(fill='steelblue', alpha=0.8) +
+  theme_minimal()
+```
+
+Corr plot of df against my predictor. Repaid is my flag so that's ignorable. cumpctofbalance is concerning however, let's check it. Hmmm...The dictionary suggests we are good with it. I shall just carry on then. It would follow that someone who has already been servicing their debt would continue to do so. 
+
+```{r}
+sig <- 0.3 # Being a bit more generous here, I'm curious
+
+#convert data to numeric in order to run correlations
+#convert to factor first to keep the integrity of the data - each value will become a number rather than turn into NA
+df_cor <- modDat %>%
+  select(Accountid, propRepaid) %>% 
+  inner_join(oldData, on="Accountid") %>% 
+  mutate_if(is.character, as.factor)
+df_cor <- df_cor %>% mutate_if(is.factor, as.numeric)
+
+# Gonna just year-ify the dates. They don't count for much really. Hoping default date has something. 
+is.POSIXct <- function(x) inherits(x, "POSIXct")
+df_cor<- df_cor %>% mutate_if(is.POSIXct, lubridate::year)
+
+corr <- cor(df_cor)
+corr[lower.tri(corr,diag=TRUE)] <- NA #drop duplicates
+corr <- as.data.frame(as.table(corr))#turn into a 3-column table
+corr <- na.omit(corr) 
+corr <- subset(corr, abs(Freq) > sig)
+corr <- corr[order(-abs(corr$Freq)),] 
+corr <- corr[corr$Var1 == "propRepaid" | corr$Var2 == "propRepaid",]
+print(corr)
+#turn corr back into matrix for plotting
+mtx_corr <- reshape2::acast(corr, Var1~Var2, value.var="Freq")
+corrplot(mtx_corr, is.corr=FALSE, tl.col="black", na.label=" ")
+```
+
+## Baseline RMSE 
+
+Mean and zero methinks
+```{r}
+err <- 0 - modDat$propRepaid
+err <- err^2
+err <- mean(err)
+sqrt(err)
+```
+```{r}
+err <- mean(modDat$propRepaid) - modDat$propRepaid
+err <- err^2
+err <- mean(err)
+sqrt(err)
+```
+## Checking old/new data columns
+```{r}
+names(newData)[!names(newData) %in% names(oldData)]
+names(oldData)[!names(oldData) %in% names(newData)]
+```
+

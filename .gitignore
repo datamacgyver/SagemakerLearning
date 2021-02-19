@@ -1,0 +1,16 @@
+﻿.idea
+.Rhistory
+azzass/venv
+Tutorial.ipynb
+Sample.ipynb
+.Rproj.user
+__pycache__
+exploration_r/.RData
+/venv/
+/.RDataFiles/
+/.ipynb_checkpoints/
+data/outputs
+/modelTraining-Copy1.ipynb
+modules/utils.py~
+arn.txt
+exploration_r/eda.html

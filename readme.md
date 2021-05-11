@@ -1,10 +1,14 @@
+Current task: Check that the new data conform to the old data and are 
+thus useful for predicting (ie not from a different population)
+
+
 # Sagemaker Learnings
 This project is best opened in a "proper" IDE such as Pycharm as you 
 can then follow the links between all the bits more easily. 
 
 The data are junk data I got from an old web coding challenge. They simply
 outline loan repayments over an 18 month period, along with loads of pre-made
-features. This gives plenty of options to build models and new features. 
+features. This gives plenty of options to build models and new features.
 
 ## Assumptions
 Many! Without access to stakeholders I've just done what the data seemed 
